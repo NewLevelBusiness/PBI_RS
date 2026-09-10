@@ -1,0 +1,627 @@
+# Развёртывание среды разработки Power BI Report Server
+
+Пошаговое руководство по настройке двух RDP-серверов под разработку отчётности на Power BI Report Server (PBIRS).
+
+Дата подготовки: сентябрь 2026. Версии дистрибутивов проверены на эту дату — перед установкой сверьтесь со ссылками в разделе 2.
+
+---
+
+## 0. Целевая схема
+
+| | **Сервер A — «бэкенд»** | **Сервер B — «рабочее место»** |
+|---|---|---|
+| Роль | СУБД + сервер отчётности | Разработка и отладка отчётов |
+| ПО | SQL Server 2025 Developer Edition<br>Power BI Report Server (May 2026)<br>SSMS 22 (опционально) | Power BI Desktop (Optimized for Report Server — May 2026)<br>SSMS 22<br>DAX Studio 3.6.1<br>Tabular Editor 2, Power BI Report Builder (опционально) |
+| Минимум ресурсов | 4 vCPU / 16 ГБ RAM / 150 ГБ диск | 4 vCPU / 16 ГБ RAM / 100 ГБ диск |
+| Рекомендуется | 8 vCPU / 32 ГБ RAM | 8 vCPU / 32 ГБ RAM |
+
+**Почему на сервере A нужно много RAM.** PBIRS содержит встроенный движок Analysis Services: каждый опубликованный `.pbix` с импортированной моделью загружается в память сервера при открытии отчёта и при обновлении по расписанию. То есть на сервере A за память конкурируют три потребителя: SQL Server, встроенный AS движок PBIRS и сама ОС. Это ключевой момент настройки — см. п. 3.6.
+
+**Почему на сервере B тоже нужно много RAM.** Power BI Desktop при импорте данных держит модель в памяти целиком и во время обновления может потреблять 2–3× от размера модели.
+
+---
+
+## 1. Подготовка: что проверить и решить до установки
+
+### 1.1 Проверка серверов
+
+Выполните на **обоих** серверах в PowerShell от администратора:
+
+```powershell
+# Версия и редакция ОС
+Get-ComputerInfo | Select-Object OsName, OsVersion, WindowsProductName, CsSystemType
+
+# Память и процессор
+Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory, NumberOfLogicalProcessors
+Get-CimInstance Win32_Processor      | Select-Object Name, NumberOfCores
+
+# Диски
+Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter, FileSystemLabel,
+    @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}},
+    @{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}}
+
+# .NET Framework (нужен 4.8 или новее — Release >= 528040)
+(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full').Release
+
+# Домен или рабочая группа
+(Get-CimInstance Win32_ComputerSystem).PartOfDomain
+```
+
+**Требования:**
+
+* ОС: Windows Server 2019 / 2022 / 2025 (либо Windows 10/11 для сервера B). Только x64.
+* .NET Framework 4.8 или новее. Если `Release` меньше 528040 — поставьте [.NET Framework 4.8](https://dotnet.microsoft.com/download/dotnet-framework/net48) и перезагрузитесь до всех остальных установок.
+* Права локального администратора на обоих серверах.
+
+### 1.2 Решения, которые нужно принять заранее
+
+| Вопрос | Рекомендация | Последствие ошибки |
+|---|---|---|
+| Домен AD или рабочая группа? | Домен | В рабочей группе не будет сквозной Windows-аутентификации между A и B, Kerberos и доменных групп доступа. Работать можно, но авторизация в портале будет через локальные учётки сервера A |
+| Collation SQL Server | `Cyrillic_General_CI_AS` для русскоязычных данных | **Меняется только переустановкой инстанса.** Решайте до установки |
+| Имя инстанса | Default (`MSSQLSERVER`), порт 1433 | Именованный инстанс требует SQL Browser и открытого UDP 1434 |
+| Сервисные учётные записи | Доменные `svc_*` или gMSA | Смена учётки PBIRS после настройки требует перепривязки ключа шифрования |
+| HTTPS в портале | Да, хотя бы самоподписанный/внутренний CA | По HTTP пароли к источникам данных ходят по сети открыто |
+
+### 1.3 Сервисные учётные записи (если есть домен)
+
+Попросите администратора AD создать (пароли — «не истекает», «нельзя менять пользователю»):
+
+| Учётка | Назначение |
+|---|---|
+| `DOMAIN\svc_sqlengine` | служба SQL Server Database Engine |
+| `DOMAIN\svc_sqlagent` | служба SQL Server Agent |
+| `DOMAIN\svc_pbirs` | служба Power BI Report Server |
+| `DOMAIN\svc_pbirs_exec` | Execution Account PBIRS (доступ к внешним файлам/источникам без учётных данных) |
+
+Плюс доменные группы доступа:
+
+| Группа | Назначение |
+|---|---|
+| `GG_PBI_Developers` | разработчики отчётов — роль Content Manager в портале |
+| `GG_PBI_Viewers` | потребители отчётов — роль Browser |
+
+Если домена нет — используйте виртуальные учётные записи служб (см. п. 3.2) и локальные группы на сервере A.
+
+### 1.4 Сетевые доступы
+
+| Направление | Порт | Назначение |
+|---|---|---|
+| B → A | TCP 1433 | подключение к SQL Server из Power BI Desktop и SSMS |
+| B → A | TCP 80 / 443 | веб-портал PBIRS и публикация отчётов |
+| A → источники данных | по ситуации | обновление по расписанию идёт **с сервера A**, а не с B |
+| A, B → интернет | TCP 443 | скачивание дистрибутивов, обновлений SSMS |
+
+Если интернета на серверах нет — скачайте все дистрибутивы заранее на машину с доступом и перенесите файлами (для SSMS понадобится offline layout, см. п. 4.2).
+
+---
+
+## 2. Выбор дистрибутивов
+
+### 2.1 Сервер A
+
+**SQL Server 2025 Developer Edition** — https://www.microsoft.com/en-us/sql-server/sql-server-downloads
+
+На странице две бесплатные редакции Developer: **Enterprise Developer** (`SQL2025-SSEI-EntDev.exe`) и **Standard Developer** (новинка 2025). Берите **Enterprise Developer** — она бесплатна, содержит все возможности Enterprise и не имеет ограничений по памяти. Юридически: только для разработки и тестирования, не для продуктива.
+
+> Важно: если в будущем прод будет на Standard, разрабатывайте на **Standard Developer** — иначе можно случайно использовать Enterprise-функции, которых в проде не окажется.
+
+**Power BI Report Server (May 2026)** — https://www.microsoft.com/en-us/download/details.aspx?id=105944
+
+Актуальная сборка на сентябрь 2026: **15.0.1121.120** (версия 1.26.9682.1442, выпущена 08.07.2026). Файл `PowerBIReportServer.exe`, ~1 ГБ.
+
+> PBIRS выходит примерно 3 раза в год (January / May / September). Список всех сборок и changelog: [Change log for Power BI Report Server](https://learn.microsoft.com/en-us/power-bi/report-server/changelog).
+
+**Про лицензирование PBIRS.** Начиная с SQL Server 2025, Microsoft консолидировала on-premise отчётность: SSRS больше не развивается (поддержка SSRS 2022 — до 11.01.2033), PBIRS стал штатным решением и доступен для редакций **Enterprise и Standard** SQL Server 2025 по тому же ключу продукта, без Software Assurance. Для SQL Server 2022 и старше право на PBIRS давала только Enterprise с активной SA.
+
+Для нашего сценария это не важно: при установке выбираем **Developer edition** — она бесплатна, ключ не нужен, полный функционал, но использовать её можно только для разработки и тестирования. Альтернатива — **Evaluation**, тот же функционал, но истекает через 180 дней. **Берите Developer, не Evaluation** — иначе через полгода среда встанет.
+
+### 2.2 Сервер B
+
+| ПО | Ссылка | Версия |
+|---|---|---|
+| **Power BI Desktop (Optimized for Power BI Report Server — May 2026)** | https://www.microsoft.com/en-us/download/details.aspx?id=106034 | May 2026, файл `PBIDesktopRS_x64.msi` |
+| **SSMS 22** | https://aka.ms/ssms/22/release/vs_SSMS.exe | 22.10.0 (08.09.2026) |
+| **DAX Studio** | https://daxstudio.org/downloads/ | 3.6.1 (31.08.2026), installer или portable |
+| Tabular Editor 2 (опц., бесплатный) | https://github.com/TabularEditor/TabularEditor/releases | последняя 2.x |
+| Power BI Report Builder (опц., для RDL/paginated) | https://www.microsoft.com/en-us/download/details.aspx?id=105942 | последняя |
+| ALM Toolkit (опц., сравнение моделей) | https://alm-toolkit.com/ | последняя |
+| Git for Windows + VS Code (опц.) | https://git-scm.com/ , https://code.visualstudio.com/ | последние |
+
+### 2.3 Главное правило совместимости
+
+> **Версия Power BI Desktop (Optimized for Report Server) должна быть из того же релиза, что и PBIRS.**
+
+Сервер May 2026 → Desktop May 2026. Отчёт, сохранённый в более новом Desktop, сервер откажется принимать или откроет с ошибкой. Обычная (не RS) версия Power BI Desktop публиковать в PBIRS **не умеет вообще** — она умеет только Power BI Service.
+
+Практическое следствие: **обновлять сервер и все рабочие места нужно синхронно**, одним окном работ. Заранее договоритесь, кто в команде отвечает за это.
+
+Если разработчику нужны обе версии (и RS, и облачная) — они уживаются на одной машине: RS-версия ставится MSI в `C:\Program Files\Microsoft Power BI Desktop RS\`, обычная — из Microsoft Store или отдельным MSI в `...\Microsoft Power BI Desktop\`. Две иконки, разные ярлыки. Но для дисциплины лучше держать на сервере B **только RS-версию**: слишком легко открыть отчёт «не тем» Desktop и сломать совместимость.
+
+---
+
+## 3. Сервер A: установка и настройка
+
+### 3.1 Разметка дисков (до установки SQL)
+
+Идеально — разные тома, но на dev-стенде допустимо разложить по папкам одного диска D:
+
+| Путь | Содержимое |
+|---|---|
+| `D:\MSSQL\DATA` | файлы данных (.mdf/.ndf) |
+| `D:\MSSQL\LOG` | журналы транзакций (.ldf) |
+| `D:\MSSQL\TEMPDB` | tempdb (в идеале — самый быстрый диск) |
+| `D:\MSSQL\BACKUP` | резервные копии |
+
+```powershell
+New-Item -ItemType Directory -Force -Path D:\MSSQL\DATA, D:\MSSQL\LOG, D:\MSSQL\TEMPDB, D:\MSSQL\BACKUP
+```
+
+### 3.2 Установка SQL Server 2025 Developer
+
+Запустите `SQL2025-SSEI-EntDev.exe` → **Download Media** → скачает ISO/CAB → смонтируйте ISO → `setup.exe`.
+
+> Вариант **Basic** в загрузчике ставит всё с настройками по умолчанию — не используйте, он не даст выбрать collation и каталоги.
+
+Пройдите мастер **Installation → New SQL Server standalone installation**:
+
+**Feature Selection** — отметьте только нужное:
+
+* ✅ **Database Engine Services**
+* ✅ **Full-Text and Semantic Extractions for Search** — пригодится, места занимает мало
+* ⬜ Analysis Services — **не нужен** для PBIRS (у него свой встроенный AS-движок). Ставьте только если планируете отдельные табличные модели SSAS как общий источник для live-подключений
+* ⬜ Integration Services — ставьте, если будете делать ETL-пакеты SSIS
+* ⬜ Machine Learning Services, PolyBase, Data Quality — не нужны
+
+**Instance Configuration**: Default instance (`MSSQLSERVER`).
+
+**Server Configuration → Service Accounts**:
+
+| Служба | Учётная запись | Startup |
+|---|---|---|
+| SQL Server Database Engine | `DOMAIN\svc_sqlengine` (или `NT Service\MSSQLSERVER`) | Automatic |
+| SQL Server Agent | `DOMAIN\svc_sqlagent` (или `NT Service\SQLSERVERAGENT`) | **Automatic** ← измените, по умолчанию Manual |
+| SQL Server Browser | — | Disabled (для default instance не нужен) |
+
+Здесь же поставьте галку **Grant Perform Volume Maintenance Task privilege** — это включает instant file initialization, файлы данных будут расти в разы быстрее.
+
+**Server Configuration → Collation**: нажмите Customize → Windows collation designator → **`Cyrillic_General`**, Case-insensitive, Accent-sensitive → получится `Cyrillic_General_CI_AS`.
+
+> Это точка невозврата. Сменить collation инстанса потом можно только переустановкой (или пересозданием всех БД). Если данные преимущественно русскоязычные и важна корректная сортировка/сравнение — берите `Cyrillic_General_CI_AS`.
+
+**Database Engine Configuration:**
+
+* *Server Configuration*: **Mixed Mode**. Задайте пароль `sa`. Нажмите **Add Current User**, добавьте `DOMAIN\svc_pbirs` и группу администраторов БД в SQL Server administrators.
+* *Data Directories*: подставьте пути из п. 3.1.
+* *TempDB*: число файлов = min(количество ядер, 8); Initial size 1024 МБ, Autogrowth 256 МБ; путь `D:\MSSQL\TEMPDB`.
+* *MaxDOP*: оставьте предложенное мастером (обычно = числу ядер до 8).
+* *Memory*: на этой вкладке мастер предложит max server memory — **не соглашайтесь с автоматикой**, задайте вручную по п. 3.6.
+
+Дальше — Install, ~15–25 минут.
+
+### 3.3 Проверка и базовая настройка SQL Server
+
+```powershell
+Get-Service MSSQL*, SQLSERVERAGENT | Select-Object Name, Status, StartType
+```
+
+Откройте порт в брандмауэре:
+
+```powershell
+New-NetFirewallRule -DisplayName "SQL Server (TCP 1433)" -Direction Inbound `
+  -Protocol TCP -LocalPort 1433 -Action Allow -Profile Domain,Private
+```
+
+Включите TCP/IP в **SQL Server Configuration Manager** → SQL Server Network Configuration → Protocols for MSSQLSERVER → TCP/IP → Enabled → перезапустите службу.
+
+Настройки экземпляра (выполните в SSMS, подключившись к серверу A):
+
+```sql
+-- Порог параллелизма: 5 по умолчанию слишком мал для аналитических запросов
+EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+EXEC sp_configure 'cost threshold for parallelism', 50; RECONFIGURE;
+
+-- Сжатие бэкапов по умолчанию
+EXEC sp_configure 'backup compression default', 1; RECONFIGURE;
+
+-- Память: см. расчёт в п. 3.6. Пример для 32 ГБ RAM на совмещённом сервере
+EXEC sp_configure 'max server memory (MB)', 12288; RECONFIGURE;
+EXEC sp_configure 'min server memory (MB)', 4096;  RECONFIGURE;
+
+-- Модель восстановления для dev-баз: SIMPLE, чтобы лог не рос
+-- ALTER DATABASE [ИмяБазы] SET RECOVERY SIMPLE;
+```
+
+### 3.4 Установка Power BI Report Server
+
+Запустите `PowerBIReportServer.exe` от администратора.
+
+1. **Install Power BI Report Server**
+2. **Choose an edition to install** → выберите из выпадающего списка **Developer** (не «Evaluation» и не «Enter product key»)
+3. Примите лицензионное соглашение
+4. Install location: `C:\Program Files\Microsoft Power BI Report Server` (по умолчанию)
+5. **Install** → ~5 минут → **Configure report server**
+
+Установщик ставит только бинарники и службу. Всё остальное — в Report Server Configuration Manager.
+
+### 3.5 Report Server Configuration Manager — по вкладкам
+
+Подключитесь к локальному серверу отчётов (имя сервера A, инстанс `PBIRS`).
+
+**Service Account**
+
+Выберите `DOMAIN\svc_pbirs` (или оставьте встроенную виртуальную учётку `NT SERVICE\PowerBIReportServer`, если домена нет). Apply. Конфигуратор попросит подтвердить резервное копирование ключа шифрования — согласитесь, сохраните `.snk` в надёжное место.
+
+> Менять сервисную учётку после того, как заработали источники данных с сохранёнными паролями, — болезненно: потребуется восстановление ключа шифрования. Решите сейчас.
+
+**Web Service URL**
+
+* Virtual Directory: `ReportServer`
+* IP Address: All Assigned
+* TCP Port: `80`
+* Apply → создастся резервирование URL `http://+:80/ReportServer`
+
+**Database** ← главный шаг
+
+* **Change Database** → Create a new report server database
+* Server Name: имя сервера A (тот же хост, инстанс по умолчанию)
+* Authentication: Current User – Integrated Security
+* Database Name: `ReportServer`, Language: Russian (или English — влияет только на форматирование в служебных сообщениях)
+* Report Server Mode: **Native Mode**
+* Credentials: Service Credentials (учётка службы PBIRS будет ходить в БД под собой)
+* Мастер создаст `ReportServer` и `ReportServerTempDB`, выдаст права
+
+**Web Portal URL**
+
+* Virtual Directory: `Reports` → Apply
+* Портал будет доступен по `http://<сервер-A>/Reports`
+
+**E-mail Settings** — заполните, только если нужны подписки на отчёты по почте: SMTP-сервер, адрес отправителя, аутентификация.
+
+**Execution Account**
+
+Укажите `DOMAIN\svc_pbirs_exec`. Эта учётка используется, когда отчёту нужно подключиться к источнику без сохранённых учётных данных (например, забрать файл с сетевой шары). Не обязательна, но лучше задать сразу.
+
+**Encryption Keys** → **Backup**
+
+⚠️ **Сделайте это немедленно и положите файл в надёжное место вместе с паролем.** Без этого ключа при переустановке или переносе сервера все сохранённые пароли к источникам данных будут потеряны, и все расписания обновления придётся настраивать заново вручную.
+
+**Scale-out Deployment** — один узел, ничего делать не нужно.
+
+**Power BI Service (cloud)** — нужна только для интеграции с облачным Power BI (кнопка «Pin to Power BI»), для нашего сценария пропускаем.
+
+### 3.6 Распределение памяти между SQL Server и PBIRS
+
+Это самая частая причина «сервер тормозит» на совмещённой конфигурации. На сервере A память делят три потребителя.
+
+Расчёт для **32 ГБ RAM**:
+
+| Потребитель | Объём | Как задать |
+|---|---|---|
+| ОС и прочее | ~4 ГБ | оставить свободным |
+| SQL Server (`max server memory`) | 12 ГБ | `sp_configure 'max server memory (MB)', 12288` |
+| PBIRS (движок моделей) | ~16 ГБ | лимиты в `rsreportserver.config` |
+
+Для **16 ГБ RAM**: ОС 3 ГБ, SQL 6 ГБ (6144), PBIRS ~7 ГБ.
+
+Лимиты PBIRS правятся в `C:\Program Files\Microsoft Power BI Report Server\PBIRS\ReportServer\rsreportserver.config`, секция `<Service>`. Значения — **проценты от общей RAM сервера**:
+
+```xml
+<Service>
+  <!-- ниже этого порога PBIRS не пытается ничего выгружать -->
+  <WorkingSetMinimum>2000000</WorkingSetMinimum>
+  <!-- верхняя граница потребления, KB -->
+  <WorkingSetMaximum>16000000</WorkingSetMaximum>
+</Service>
+```
+
+После правки — перезапуск службы:
+
+```powershell
+Restart-Service PowerBIReportServer
+```
+
+> Правьте `rsreportserver.config` только с предварительной копией файла: синтаксическая ошибка в XML приводит к тому, что служба не стартует.
+
+### 3.7 Настройки сервера отчётов через SSMS
+
+Подключитесь в SSMS: **Connect → Reporting Services** → имя сервера A → правой кнопкой на сервере → **Properties → Advanced**:
+
+| Параметр | По умолчанию | Рекомендация |
+|---|---|---|
+| `MaxFileSizeMb` | 1000 | до **2000** (жёсткий потолок платформы). Помните: сам файл ещё нужно развернуть в память |
+| `ScheduleRefreshTimeoutMinutes` | 120 | увеличьте, если обновления больших моделей не укладываются |
+| `EnableIntegratedSecurity` | True | оставить |
+| `EnableClientPrinting` | True | оставить |
+| `SnapshotCompression` | — | включить, если активно используете снапшоты |
+
+### 3.8 HTTPS (рекомендуется)
+
+Для dev-стенда достаточно самоподписанного сертификата:
+
+```powershell
+$cert = New-SelfSignedCertificate -DnsName "pbirs.contoso.local", "pbirs" `
+  -CertStoreLocation "cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3) `
+  -FriendlyName "PBIRS Dev"
+$cert.Thumbprint
+```
+
+Затем в Report Server Configuration Manager: **Web Service URL** → Advanced → HTTPS Certificates → Add → выберите сертификат, порт 443. То же для **Web Portal URL**. После этого экспортируйте сертификат (без приватного ключа) и импортируйте его на сервере B в **Trusted Root Certification Authorities**, иначе браузер и Power BI Desktop будут ругаться.
+
+Откройте порты:
+
+```powershell
+New-NetFirewallRule -DisplayName "PBIRS HTTP"  -Direction Inbound -Protocol TCP -LocalPort 80  -Action Allow -Profile Domain,Private
+New-NetFirewallRule -DisplayName "PBIRS HTTPS" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow -Profile Domain,Private
+```
+
+### 3.9 Kerberos / SPN (только для домена)
+
+Если служба PBIRS работает под доменной учёткой, зарегистрируйте SPN — иначе Windows-аутентификация в портале будет падать в NTLM или в бесконечный запрос пароля:
+
+```cmd
+setspn -S HTTP/pbirs DOMAIN\svc_pbirs
+setspn -S HTTP/pbirs.contoso.local DOMAIN\svc_pbirs
+setspn -L DOMAIN\svc_pbirs
+```
+
+В `rsreportserver.config` в секции `<AuthenticationTypes>` должно быть:
+
+```xml
+<AuthenticationTypes>
+  <RSWindowsNegotiate/>
+  <RSWindowsNTLM/>
+</AuthenticationTypes>
+```
+
+> **Проблема двойного прыжка (double hop).** Пользователь → PBIRS → источник данных: Windows-учётка пользователя по умолчанию не передаётся дальше первого прыжка. Для обновления по расписанию это в принципе неприменимо (пользователя в момент обновления нет). **Решение по умолчанию: сохранённые учётные данные (stored credentials) в настройках источника данных отчёта.** Constrained delegation настраивайте только если действительно нужен per-user доступ в DirectQuery/Live-режиме.
+
+### 3.10 Права доступа в портале
+
+Откройте `http://<сервер-A>/Reports`:
+
+* **Настройки сайта (шестерёнка) → Security** — уровень всего портала. Добавьте `DOMAIN\GG_PBI_Developers` с ролью **System Administrator** (для тех, кто будет управлять сервером).
+* На корневой папке → **Manage → Security** — снимите наследование и назначьте:
+  * `GG_PBI_Developers` → **Content Manager** (публикация, изменение, настройка расписаний)
+  * `GG_PBI_Viewers` → **Browser** (только просмотр)
+
+Структуру папок заведите сразу: `/Разработка`, `/Тест`, `/Продуктив` — с разными правами. Позже переносить отчёты между папками с сохранением расписаний неудобно.
+
+### 3.11 Драйверы источников данных
+
+⚠️ **Обновление по расписанию выполняется на сервере A, а не на рабочем месте разработчика.** Значит, все ODBC/OLE DB драйверы, которые используют ваши отчёты, должны быть установлены **и на B (для разработки), и на A (для обновления)** — одинаковых версий и разрядности x64.
+
+Типовой список: [Microsoft ODBC Driver for SQL Server](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server), драйверы PostgreSQL / MySQL / Oracle, [Access Database Engine](https://www.microsoft.com/download/details.aspx?id=54920) (для Excel/Access-источников).
+
+Отдельно: если источники — файлы Excel на сетевой шаре, учётке службы PBIRS (или Execution Account) нужен доступ к этой шаре по UNC-пути. Локальные пути вида `C:\Users\...\file.xlsx` в опубликованном отчёте работать не будут.
+
+### 3.12 Резервное копирование сервера A
+
+Настройте с первого дня, объекты для бэкапа:
+
+1. Базы `ReportServer` и `ReportServerTempDB` — обычным SQL Server Agent job
+2. **Ключ шифрования** (`.snk`) — разово, при каждой смене сервисной учётки
+3. `rsreportserver.config`, `rsserver.config`, `web.config` из `C:\Program Files\Microsoft Power BI Report Server\PBIRS\ReportServer\`
+4. Рабочие базы данных проекта
+
+---
+
+## 4. Сервер B: рабочее место разработчика
+
+### 4.1 Power BI Desktop (Optimized for Report Server)
+
+1. Скачайте `PBIDesktopRS_x64.msi` — https://www.microsoft.com/en-us/download/details.aspx?id=106034 (**May 2026**, тот же релиз, что сервер)
+2. Установите от администратора, по умолчанию в `C:\Program Files\Microsoft Power BI Desktop RS\`
+3. Проверьте версию: **Файл → Справка → О программе** — должна быть May 2026
+
+Тихая установка для нескольких машин:
+
+```powershell
+Start-Process msiexec.exe -Wait -ArgumentList `
+  '/i PBIDesktopRS_x64.msi /qn ACCEPT_EULA=1 DISABLE_UPDATE_NOTIFICATION=1'
+```
+
+**Настройки после установки** (Файл → Параметры и настройки → Параметры):
+
+| Раздел | Что изменить | Зачем |
+|---|---|---|
+| Загрузка данных → **Автоматические дата и время для новых файлов** | **Снять галку** | Иначе Power BI создаёт скрытую таблицу дат для каждого поля с датой, раздувая модель. Делайте свой календарь |
+| Загрузка данных → Уровни конфиденциальности | «Всегда игнорировать уровни конфиденциальности» на dev-стенде | Иначе Power Query отказывается объединять источники разной классификации (Formula.Firewall) |
+| Региональные параметры → Языковой стандарт для импорта | Russian (Russia) или тот, что соответствует данным | Иначе даты и десятичные разделители парсятся неверно |
+| Автовосстановление | Включить, интервал 5–10 мин | |
+| Отчёт → Каталог по умолчанию | Общая папка проекта / рабочая копия git | |
+| Функции предварительного просмотра | Не включать без необходимости | Preview-функции могут быть не поддержаны сервером |
+
+**Подключение к серверу для публикации:** Файл → Сохранить как → **Сервер отчётов Power BI** → адрес `http://<сервер-A>/ReportServer` (это Web Service URL, **не** адрес портала `/Reports`).
+
+### 4.2 SSMS 22
+
+Скачайте bootstrapper: https://aka.ms/ssms/22/release/vs_SSMS.exe
+
+Начиная с SSMS 21 установка идёт через Visual Studio Installer, поэтому `vs_SSMS.exe` — это маленький загрузчик (~5 МБ), которому **нужен интернет**. Если его нет, соберите offline layout на машине с доступом:
+
+```cmd
+vs_SSMS.exe --layout C:\ssms_layout --lang en-US
+```
+
+и перенесите папку `C:\ssms_layout` на сервер B, запустив оттуда `vs_setup.exe`.
+
+Актуальная версия: 22.10.0 (08.09.2026).
+
+Установите SSMS **и на сервере B, и на сервере A** — на A он нужен для настроек сервера отчётов (п. 3.7) и обслуживания баз.
+
+Полезные настройки SSMS: Tools → Options → Query Results → Results to Grid → увеличьте «Maximum Characters Retrieved» для non-XML data до 65535.
+
+### 4.3 DAX Studio
+
+Скачайте с https://daxstudio.org/downloads/ — актуальная версия **3.6.1** (31.08.2026). Два варианта:
+
+* **Installer** (~20 МБ) — обычная установка, интеграция с Excel как надстройка
+* **Portable** (~31 МБ) — распаковать в папку, без прав администратора
+
+При установке отметьте **Excel Add-in**, если планируете анализировать модели из Excel.
+
+**Что важно понимать про DAX Studio и PBIRS.** DAX Studio подключается к:
+
+* локальному экземпляру Analysis Services, который поднимает Power BI Desktop при открытом файле — **основной сценарий отладки**;
+* полноценным серверам SSAS Tabular;
+* Power BI Service через XMLA endpoint (Premium).
+
+**К модели, опубликованной на PBIRS, подключиться напрямую нельзя** — у PBIRS нет XMLA endpoint. Поэтому рабочий цикл такой: открыли `.pbix` локально в Power BI Desktop → подключились DAX Studio к этому экземпляру → отладили запросы, посмотрели Server Timings и VertiPaq Analyzer → сохранили → опубликовали на сервер.
+
+Ключевые возможности, ради которых он ставится:
+
+* **Server Timings** — сколько времени запрос провёл в формульном движке (FE) и движке хранения (SE), сколько было SE-запросов. Основной инструмент поиска медленных мер
+* **VertiPaq Analyzer** — размер модели по таблицам и колонкам, кардинальность, сжатие. Показывает, какие колонки надо выкинуть
+* **Query Plan** — физический и логический план выполнения DAX
+* Выполнение произвольных DAX/MDX-запросов и выгрузка результата
+
+### 4.4 Дополнительные инструменты (рекомендуется)
+
+| Инструмент | Зачем |
+|---|---|
+| **Tabular Editor 2** (бесплатный) | Массовое редактирование модели: переименование колонок, создание десятков мер, форматирование DAX, Best Practice Analyzer. Быстрее интерфейса Power BI Desktop на порядок |
+| **Power BI Report Builder** | Разработка RDL-отчётов (постраничные, «под печать», с точным позиционированием). PBIRS хранит и RDL, и PBIX — RDL по-прежнему лучший выбор для табличных выгрузок и печатных форм |
+| **ALM Toolkit** | Сравнение двух моделей и перенос изменений между ними — аналог diff для `.pbix` |
+| **Git + VS Code** | Версионирование. `.pbix` — бинарник, git его не сдиффит, но история версий и откат работают. `.rdl` — обычный XML, диффится нормально |
+| **PowerShell модуль ReportingServicesTools** | Автоматизация деплоя: `Install-Module ReportingServicesTools`. Позволяет скриптом заливать отчёты, переносить папки, копировать права между серверами |
+
+Все инструменты из этого списка интегрируются в ленту Power BI Desktop через **Внешние средства** (External Tools) — Tabular Editor, DAX Studio и ALM Toolkit прописываются туда автоматически при установке.
+
+---
+
+## 5. Сквозная проверка (smoke test)
+
+Пройдите этот сценарий целиком — он проверяет все связки разом.
+
+**1. На сервере A** — создайте тестовую базу:
+
+```sql
+CREATE DATABASE TestBI;
+GO
+USE TestBI;
+GO
+CREATE TABLE dbo.Sales (
+    SaleId    int IDENTITY PRIMARY KEY,
+    SaleDate  date          NOT NULL,
+    Product   nvarchar(100) NOT NULL,
+    Amount    decimal(18,2) NOT NULL
+);
+INSERT dbo.Sales (SaleDate, Product, Amount) VALUES
+    ('2026-01-15', N'Товар А', 1500.00),
+    ('2026-02-20', N'Товар Б', 2300.50),
+    ('2026-03-10', N'Товар А', 1750.25),
+    ('2026-04-05', N'Товар В',  980.00);
+GO
+```
+
+**2. На сервере B** — в Power BI Desktop RS: Получить данные → SQL Server → сервер A, база `TestBI` → режим **Импорт** → таблица `Sales`. Постройте столбчатую диаграмму «Сумма по продукту» и меру:
+
+```dax
+Продажи = SUM ( Sales[Amount] )
+```
+
+**3. Отладка** — Внешние средства → DAX Studio → должно подключиться к локальному экземпляру. Включите **Server Timings**, выполните:
+
+```dax
+EVALUATE SUMMARIZECOLUMNS ( Sales[Product], "Сумма", [Продажи] )
+```
+
+Убедитесь, что видите разбивку FE/SE. Загляните в **VertiPaq Analyzer** — там должен появиться размер таблицы.
+
+**4. Публикация** — Файл → Сохранить как → Сервер отчётов Power BI → `http://<сервер-A>/ReportServer` → папка `/Разработка` → имя `SmokeTest`.
+
+**5. Проверка в портале** — откройте `http://<сервер-A>/Reports`, найдите отчёт, откройте. Визуал должен отрисоваться.
+
+**6. Учётные данные источника** — в портале: многоточие у отчёта → **Управление → Источники данных** → тип аутентификации **«Использовать следующие учётные данные»**, укажите доменную учётку или SQL-логин с правами на `TestBI`, поставьте галку **«Использовать как учётные данные Windows»** при доменной учётке → **Проверить подключение** → должно быть «Подключение выполнено успешно».
+
+**7. Расписание обновления** — **Управление → Запланированное обновление** → New Scheduled Refresh Plan → например, ежедневно в 06:00 → сохраните → нажмите **Обновить сейчас**. Через минуту в истории обновлений должен появиться статус **Completed**.
+
+Если пункт 7 прошёл — среда собрана правильно: работает и публикация, и серверное обновление данных со всеми правами.
+
+---
+
+## 6. Типовые грабли
+
+| Симптом | Причина | Решение |
+|---|---|---|
+| Отчёт не публикуется, «версия не поддерживается» | Desktop новее сервера | Поставить Desktop ровно того же релиза, что PBIRS (п. 2.3) |
+| В обычном Power BI Desktop нет пункта «Сохранить на сервер отчётов» | Установлена не RS-версия | Скачать «Optimized for Power BI Report Server» |
+| Обновление по расписанию падает: «credentials are not stored» | Источник настроен на Windows-аутентификацию пользователя | Задать stored credentials в настройках источника (п. 5.6) |
+| Обновление падает: «источник данных не найден» / нет драйвера | Драйвер стоит на B, но не на A | Поставить тот же драйвер x64 на сервер A (п. 3.11) |
+| Обновление падает по таймауту | Модель большая | Увеличить `ScheduleRefreshTimeoutMinutes`, оптимизировать модель через VertiPaq Analyzer |
+| «This file is too large, maximum is 1000MB» | `MaxFileSizeMb` | Поднять до 2000 в SSMS (п. 3.7). Выше — нельзя, это потолок платформы; надо уменьшать модель |
+| Портал бесконечно спрашивает пароль | Нет SPN / неверный Negotiate | Зарегистрировать SPN (п. 3.9), добавить сайт в зону местной интрасети в IE/Edge |
+| Сервер «тормозит» при работе с отчётами | SQL Server съел всю память | Ограничить `max server memory` (п. 3.6) |
+| Служба PBIRS не стартует после правки конфига | Битый XML в `rsreportserver.config` | Восстановить из копии |
+| Русские буквы сортируются неправильно | Collation `SQL_Latin1_General_CP1_CI_AS` | Либо `COLLATE` в запросах, либо переустановка инстанса |
+| Формулы Power Query падают с «Formula.Firewall» | Уровни конфиденциальности источников | Настроить privacy levels или отключить их на dev (п. 4.1) |
+| Через 180 дней всё перестало работать | Установлена редакция Evaluation | Только Developer для dev-стенда (п. 2.1) |
+| Потеряны все пароли источников после переустановки | Не сохранён ключ шифрования | Профилактика: бэкап ключа сразу (п. 3.5) |
+
+---
+
+## 7. Чек-листы
+
+### Сервер A
+
+- [ ] ОС Windows Server 2019/2022/2025, .NET Framework 4.8+
+- [ ] Диски размечены, каталоги созданы
+- [ ] Сервисные учётные записи созданы в AD
+- [ ] SQL Server 2025 Developer установлен, collation `Cyrillic_General_CI_AS`
+- [ ] SQL Agent в Automatic, TCP/IP включён, порт 1433 открыт
+- [ ] `max server memory` ограничен с учётом PBIRS
+- [ ] `cost threshold for parallelism` = 50, tempdb на N файлов
+- [ ] PBIRS May 2026 установлен в редакции **Developer**
+- [ ] Config Manager: сервисная учётка, Web Service URL, БД `ReportServer`, Web Portal URL
+- [ ] **Ключ шифрования забэкаплен, файл и пароль сохранены вне сервера**
+- [ ] HTTPS-сертификат привязан, порты 80/443 открыты
+- [ ] SPN зарегистрированы (если домен)
+- [ ] Права в портале назначены, структура папок создана
+- [ ] Драйверы источников данных установлены
+- [ ] `MaxFileSizeMb` проверен/поднят
+- [ ] Настроен бэкап баз `ReportServer*` и конфигов
+- [ ] SSMS 22 установлен
+
+### Сервер B
+
+- [ ] Power BI Desktop (Optimized for Report Server) **May 2026** установлен
+- [ ] Версия совпадает с релизом сервера
+- [ ] Автоматические дата/время отключены, локаль импорта задана
+- [ ] SSMS 22 установлен и подключается к серверу A
+- [ ] DAX Studio 3.6.1 установлен, подключается к локальному экземпляру Desktop
+- [ ] Tabular Editor 2 / Report Builder / ALM Toolkit — по потребности
+- [ ] Драйверы источников данных установлены (те же, что на A)
+- [ ] Сертификат PBIRS импортирован в доверенные корневые (при HTTPS)
+- [ ] Git / VS Code настроены, репозиторий для `.pbix` и `.rdl` заведён
+
+### Приёмка среды
+
+- [ ] Сквозной сценарий из раздела 5 пройден полностью, включая обновление по расписанию
+
+---
+
+## 8. Что нужно уточнить перед стартом
+
+1. **Версии ОС на обоих RDP** — от этого зависит, потребуется ли доустановка .NET Framework 4.8.
+2. **Домен или рабочая группа** — определяет схему учётных записей и аутентификации.
+3. **Фактические ресурсы (CPU/RAM/диск)** — от этого считается распределение памяти в п. 3.6.
+4. **Есть ли интернет с серверов** — иначе нужен offline layout для SSMS и заранее скачанные дистрибутивы.
+5. **Какая редакция SQL Server планируется в продуктиве** (Standard или Enterprise) — чтобы разрабатывать на соответствующей редакции Developer.
+6. **Состав источников данных** — определяет список драйверов, которые нужно поставить на оба сервера.
+
+---
+
+## Источники
+
+* [Download Power BI Report Server — May 2026](https://www.microsoft.com/en-us/download/details.aspx?id=105944)
+* [Download Power BI Desktop (Optimized for Power BI Report Server — May 2026)](https://www.microsoft.com/en-us/download/details.aspx?id=106034)
+* [Change log for Power BI Report Server](https://learn.microsoft.com/en-us/power-bi/report-server/changelog)
+* [Hardware and software requirements for installing Power BI Report Server](https://learn.microsoft.com/en-us/power-bi/report-server/system-requirements)
+* [Install Power BI Report Server](https://learn.microsoft.com/en-us/power-bi/report-server/install-report-server)
+* [Reporting Services Consolidation FAQ (SQL Server 2025)](https://learn.microsoft.com/en-us/sql/reporting-services/reporting-services-consolidation-faq?view=sql-server-ver17)
+* [SQL Server Downloads (Developer Edition)](https://www.microsoft.com/en-us/sql-server/sql-server-downloads)
+* [Release Notes for SQL Server Management Studio 22](https://learn.microsoft.com/en-us/ssms/release-notes-22)
+* [Install SQL Server Management Studio](https://learn.microsoft.com/en-us/ssms/install/install)
+* [DAX Studio — Downloads](https://daxstudio.org/downloads/)
+* [DAX Studio — SQLBI](https://www.sqlbi.com/tools/dax-studio/)
