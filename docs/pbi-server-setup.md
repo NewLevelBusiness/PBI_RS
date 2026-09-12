@@ -6,6 +6,23 @@
 
 ---
 
+## Как читать команды
+
+Перед каждым блоком кода указано, **где именно** его выполнять.
+
+| Пометка | Что открывать |
+|---|---|
+| **PowerShell** | Пуск → Windows PowerShell. «От администратора» — правой кнопкой по значку → «Запуск от имени администратора». Без этого часть команд молча не сработает |
+| **Командная строка** | Пуск → cmd, тоже от администратора там, где указано |
+| **SSMS** | SQL Server Management Studio: подключиться к серверу, `Ctrl+N` — новое окно запроса, `F5` — выполнить |
+| **Power BI Desktop** | Окно приложения на рабочем месте разработчика |
+| **DAX Studio** | Отдельное приложение, подключённое к открытой в Desktop модели |
+| **Блокнот от администратора** | Правка конфигурационного файла. Перед изменением сделайте копию файла |
+
+Рядом указан сервер: **сервер A** — СУБД и сервер отчётов, **сервер B** — рабочее место разработчика. В паспорте стенда (раздел 10) это `SLI-BIDB` и `SLI-BISD`.
+
+---
+
 ## 0. Целевая схема
 
 | | **Сервер A — «бэкенд»** | **Сервер B — «рабочее место»** |
@@ -59,6 +76,7 @@
 
 Выполните на **обоих** серверах в PowerShell от администратора:
 
+▸ **PowerShell** · оба сервера · от администратора
 ```powershell
 # Версия и редакция ОС
 Get-ComputerInfo | Select-Object OsName, OsVersion, WindowsProductName, CsSystemType
@@ -170,7 +188,6 @@ Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter, FileSystemLab
 
 Если разработчику нужны обе версии (и RS, и облачная) — они уживаются на одной машине: RS-версия ставится MSI в `C:\Program Files\Microsoft Power BI Desktop RS\`, обычная — из Microsoft Store или отдельным MSI в `...\Microsoft Power BI Desktop\`. Две иконки, разные ярлыки. Но для дисциплины лучше держать на сервере B **только RS-версию**: слишком легко открыть отчёт «не тем» Desktop и сломать совместимость.
 
-
 ### 2.4 Лицензирование: что бесплатно, а что нет
 
 **Для стенда разработки всё бесплатно и не требует ключей:**
@@ -228,6 +245,7 @@ Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter, FileSystemLab
 | `D:\MSSQL\TEMPDB` | tempdb (в идеале — самый быстрый диск) |
 | `D:\MSSQL\BACKUP` | резервные копии |
 
+▸ **PowerShell** · сервер A · от администратора
 ```powershell
 New-Item -ItemType Directory -Force -Path D:\MSSQL\DATA, D:\MSSQL\LOG, D:\MSSQL\TEMPDB, D:\MSSQL\BACKUP
 ```
@@ -276,12 +294,14 @@ New-Item -ItemType Directory -Force -Path D:\MSSQL\DATA, D:\MSSQL\LOG, D:\MSSQL\
 
 ### 3.3 Проверка и базовая настройка SQL Server
 
+▸ **PowerShell** · сервер A
 ```powershell
 Get-Service MSSQL*, SQLSERVERAGENT | Select-Object Name, Status, StartType
 ```
 
 Откройте порт в брандмауэре:
 
+▸ **PowerShell** · сервер A · от администратора
 ```powershell
 New-NetFirewallRule -DisplayName "SQL Server (TCP 1433)" -Direction Inbound `
   -Protocol TCP -LocalPort 1433 -Action Allow -Profile Domain,Private
@@ -291,6 +311,7 @@ New-NetFirewallRule -DisplayName "SQL Server (TCP 1433)" -Direction Inbound `
 
 Настройки экземпляра (выполните в SSMS, подключившись к серверу A):
 
+▸ **SSMS** · подключение к серверу A · новое окно запроса (Ctrl+N), выполнить F5
 ```sql
 -- Порог параллелизма: 5 по умолчанию слишком мал для аналитических запросов
 EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
@@ -317,6 +338,7 @@ EXEC sp_configure 'min server memory (MB)', 4096;  RECONFIGURE;
 2. Перезапустить службу: `Restart-Service MSSQLSERVER`
 3. Открыть порт (если ещё не открыт):
 
+▸ **PowerShell** · сервер A · от администратора
 ```powershell
 New-NetFirewallRule -DisplayName "SQL Server (TCP 1433)" -Direction Inbound `
   -Protocol TCP -LocalPort 1433 -Action Allow -Profile Domain,Private
@@ -326,6 +348,7 @@ New-NetFirewallRule -DisplayName "SQL Server (TCP 1433)" -Direction Inbound `
 
 **Проверка с сервера B** — до запуска SSMS, чтобы отделить сетевую проблему от проблемы аутентификации:
 
+▸ **PowerShell** · сервер B
 ```powershell
 Test-NetConnection SRV-SQL01.contoso.local -Port 1433
 ```
@@ -406,6 +429,7 @@ Test-NetConnection SRV-SQL01.contoso.local -Port 1433
 
 Лимиты PBIRS правятся в `C:\Program Files\Microsoft Power BI Report Server\PBIRS\ReportServer\rsreportserver.config`, секция `<Service>`. Значения — **проценты от общей RAM сервера**:
 
+▸ **Блокнот от администратора** · сервер A · файл `rsreportserver.config`
 ```xml
 <Service>
   <!-- ниже этого порога PBIRS не пытается ничего выгружать -->
@@ -417,6 +441,7 @@ Test-NetConnection SRV-SQL01.contoso.local -Port 1433
 
 После правки — перезапуск службы:
 
+▸ **PowerShell** · сервер A · от администратора
 ```powershell
 Restart-Service PowerBIReportServer
 ```
@@ -439,6 +464,7 @@ Restart-Service PowerBIReportServer
 
 Для dev-стенда достаточно самоподписанного сертификата:
 
+▸ **PowerShell** · сервер A · от администратора
 ```powershell
 $cert = New-SelfSignedCertificate -DnsName "pbirs.contoso.local", "pbirs" `
   -CertStoreLocation "cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3) `
@@ -450,6 +476,7 @@ $cert.Thumbprint
 
 Откройте порты:
 
+▸ **PowerShell** · сервер A · от администратора
 ```powershell
 New-NetFirewallRule -DisplayName "PBIRS HTTP"  -Direction Inbound -Protocol TCP -LocalPort 80  -Action Allow -Profile Domain,Private
 New-NetFirewallRule -DisplayName "PBIRS HTTPS" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow -Profile Domain,Private
@@ -459,6 +486,7 @@ New-NetFirewallRule -DisplayName "PBIRS HTTPS" -Direction Inbound -Protocol TCP 
 
 Если служба PBIRS работает под доменной учёткой, зарегистрируйте SPN — иначе Windows-аутентификация в портале будет падать в NTLM или в бесконечный запрос пароля:
 
+▸ **Командная строка** · сервер A · от администратора
 ```cmd
 setspn -S HTTP/pbirs DOMAIN\svc_pbirs
 setspn -S HTTP/pbirs.contoso.local DOMAIN\svc_pbirs
@@ -467,6 +495,7 @@ setspn -L DOMAIN\svc_pbirs
 
 В `rsreportserver.config` в секции `<AuthenticationTypes>` должно быть:
 
+▸ **Блокнот от администратора** · сервер A · файл `rsreportserver.config`
 ```xml
 <AuthenticationTypes>
   <RSWindowsNegotiate/>
@@ -524,6 +553,7 @@ setspn -L DOMAIN\svc_pbirs
 
 **Права в SQL Server** — минимально необходимые, только чтение и только тех баз, откуда берут данные отчёты:
 
+▸ **SSMS** · подключение к серверу A · новое окно запроса
 ```sql
 USE master;
 CREATE LOGIN [DOMAIN\svc_bi_reader] FROM WINDOWS;
@@ -553,6 +583,7 @@ GO
 
 Тихая установка для нескольких машин:
 
+▸ **PowerShell** · сервер B · от администратора
 ```powershell
 Start-Process msiexec.exe -Wait -ArgumentList `
   '/i PBIDesktopRS_x64.msi /qn ACCEPT_EULA=1 DISABLE_UPDATE_NOTIFICATION=1'
@@ -579,6 +610,7 @@ Start-Process msiexec.exe -Wait -ArgumentList `
 
 Начиная с SSMS 21 установка идёт через Visual Studio Installer, поэтому `vs_SSMS.exe` — это маленький загрузчик (~5 МБ), которому **нужен интернет**. Если его нет, соберите offline layout на машине с доступом:
 
+▸ **Командная строка** · машина с доступом в интернет
 ```cmd
 vs_SSMS.exe --layout C:\ssms_layout --lang en-US
 ```
@@ -599,6 +631,7 @@ vs_SSMS.exe --layout C:\ssms_layout --lang en-US
 
 Узнать имя машины и тип экземпляра:
 
+▸ **PowerShell** · тот сервер, имя которого выясняете
 ```powershell
 $env:COMPUTERNAME
 (Get-CimInstance Win32_ComputerSystem).Domain     # для FQDN
@@ -668,6 +701,7 @@ Get-Service MSSQL* | Select-Object Name, DisplayName, Status
 
 **1. На сервере A** — создайте тестовую базу:
 
+▸ **SSMS** · подключение к серверу A · новое окно запроса
 ```sql
 CREATE DATABASE TestBI;
 GO
@@ -689,12 +723,14 @@ GO
 
 **2. На сервере B** — в Power BI Desktop RS: Получить данные → SQL Server → сервер A, база `TestBI` → режим **Импорт** → таблица `Sales`. Постройте столбчатую диаграмму «Сумма по продукту» и меру:
 
+▸ **Power BI Desktop** · сервер B · Новая мера, строка формул
 ```dax
 Продажи = SUM ( Sales[Amount] )
 ```
 
 **3. Отладка** — Внешние средства → DAX Studio → должно подключиться к локальному экземпляру. Включите **Server Timings**, выполните:
 
+▸ **DAX Studio** · сервер B · окно запроса, выполнить F5
 ```dax
 EVALUATE SUMMARIZECOLUMNS ( Sales[Product], "Сумма", [Продажи] )
 ```
@@ -798,6 +834,7 @@ EVALUATE SUMMARIZECOLUMNS ( Sales[Product], "Сумма", [Продажи] )
 
 **Диагностика** — обязательно в консоли, запущенной **от имени администратора**, иначе привилегии в токене не показываются:
 
+▸ **PowerShell** · сервер A · от администратора
 ```powershell
 whoami /priv | Select-String "SeDebug|SeBackup|SeSecurity"
 
@@ -831,7 +868,8 @@ net localgroup RS_NT_Debug /domain
 
 **Решение** — запуск из командной строки от имени администратора с отключённым поиском обновлений. Страница «Обновления продукта» тогда вообще исчезает из мастера:
 
-```
+▸ **Командная строка** · сервер A · от администратора
+```cmd
 D:\setup.exe /ACTION=Install /UpdateEnabled=False
 ```
 
